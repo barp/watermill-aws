@@ -236,6 +236,57 @@ func TestPublishSubscribe_batching(t *testing.T) {
 	)
 }
 
+func TestPublishSubscribe_concurrent_workers(t *testing.T) {
+	t.Parallel()
+
+	tests.TestPublishSubscribe(
+		t,
+		tests.TestContext{
+			TestID: tests.NewTestID(),
+			Features: tests.Features{
+				ConsumerGroups:                      true,
+				ExactlyOnceDelivery:                 false,
+				GuaranteedOrder:                     false,
+				GuaranteedOrderWithSingleSubscriber: false,
+				Persistent:                          true,
+				// Currently none of emulators are stable enough to
+				// handle all tests, see: https://github.com/localstack/localstack/issues/2074
+				ForceShort: true,
+			},
+		},
+		func(t *testing.T) (message.Publisher, message.Subscriber) {
+			cfg := newAwsConfig(t)
+
+			return createPubSubWithConfig(
+				t,
+				sqs.PublisherConfig{
+					AWSConfig: cfg,
+					OptFns: []func(*amazonsqs.Options){
+						GetEndpointResolverSqs(),
+					},
+					CreateQueueConfig: sqs.QueueConfigAttributes{
+						// Default value is 30 seconds - need to be lower for tests
+						VisibilityTimeout: "1",
+					},
+					Marshaler: sqs.DefaultMarshalerUnmarshaler{},
+				},
+				sqs.SubscriberConfig{
+					AWSConfig: cfg,
+					OptFns: []func(*amazonsqs.Options){
+						GetEndpointResolverSqs(),
+					},
+					QueueConfigAttributes: sqs.QueueConfigAttributes{
+						// Default value is 30 seconds - need to be lower for tests
+						VisibilityTimeout: "1",
+					},
+					ConsumeWorkers: 4,
+					Unmarshaler:    sqs.DefaultMarshalerUnmarshaler{},
+				},
+			)
+		},
+	)
+}
+
 func TestPublishSubscribe_creating_queue_with_different_settings_should_be_idempotent(t *testing.T) {
 	t.Parallel()
 

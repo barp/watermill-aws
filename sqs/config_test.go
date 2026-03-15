@@ -7,6 +7,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSubscriberConfig_SetDefaults_ConsumeWorkers(t *testing.T) {
+	t.Run("defaults to 1 when not set", func(t *testing.T) {
+		cfg := sqs.SubscriberConfig{}
+		cfg.SetDefaults()
+		require.Equal(t, 1, cfg.ConsumeWorkers)
+	})
+
+	t.Run("defaults to 1 when set to 0", func(t *testing.T) {
+		cfg := sqs.SubscriberConfig{ConsumeWorkers: 0}
+		cfg.SetDefaults()
+		require.Equal(t, 1, cfg.ConsumeWorkers)
+	})
+
+	t.Run("defaults to 1 when negative", func(t *testing.T) {
+		cfg := sqs.SubscriberConfig{ConsumeWorkers: -5}
+		cfg.SetDefaults()
+		require.Equal(t, 1, cfg.ConsumeWorkers)
+	})
+
+	t.Run("preserves explicit positive value", func(t *testing.T) {
+		cfg := sqs.SubscriberConfig{ConsumeWorkers: 10}
+		cfg.SetDefaults()
+		require.Equal(t, 10, cfg.ConsumeWorkers)
+	})
+}
+
 func TestQueueConfigAttributes_Attributes(t *testing.T) {
 	structAttrs := sqs.QueueConfigAttributes{
 		DelaySeconds:                  "10",
