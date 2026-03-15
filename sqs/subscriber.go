@@ -95,11 +95,20 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 	s.logger.With(watermill.LogFields{"queue": *resolvedQueue.QueueURL}).Info("Subscribing to queue", nil)
 
 	ctx, cancel := context.WithCancel(ctx)
-	s.subscribersWg.Add(1)
 	output := make(chan *message.Message)
 
+	var workersWg sync.WaitGroup
+	for i := 0; i < s.config.ConsumeWorkers; i++ {
+		s.subscribersWg.Add(1)
+		workersWg.Add(1)
+		go func() {
+			defer workersWg.Done()
+			s.receive(ctx, *resolvedQueue.QueueURL, output, receiveInput)
+		}()
+	}
+
 	go func() {
-		s.receive(ctx, *resolvedQueue.QueueURL, output, receiveInput)
+		workersWg.Wait()
 		close(output)
 		cancel()
 	}()
