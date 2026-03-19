@@ -40,6 +40,15 @@ type SubscriberConfig struct {
 	// GenerateDeleteMessageInput generates *sqs.DeleteMessageInput for AWS SDK.
 	GenerateDeleteMessageInput GenerateDeleteMessageInputFunc
 
+	// ChangeVisibilityOnNack controls whether the message visibility timeout is reset when a message
+	// is nacked, making it immediately available for redelivery. Defaults to false.
+	ChangeVisibilityOnNack bool
+
+	// GenerateChangeMessageVisibilityInput generates *sqs.ChangeMessageVisibilityInput for AWS SDK.
+	// Used when a message is nacked to make it visible again for redelivery.
+	// Only used when ChangeVisibilityOnNack is true.
+	GenerateChangeMessageVisibilityInput GenerateChangeMessageVisibilityInputFunc
+
 	// ConsumeWorkers is the number of goroutines that will concurrently receive and process messages
 	// from the SQS queue per Subscribe call. Each worker independently polls SQS and processes messages.
 	// Defaults to 1.
@@ -67,6 +76,10 @@ func (c *SubscriberConfig) SetDefaults() {
 
 	if c.GenerateDeleteMessageInput == nil {
 		c.GenerateDeleteMessageInput = GenerateDeleteMessageInputDefault
+	}
+
+	if c.GenerateChangeMessageVisibilityInput == nil {
+		c.GenerateChangeMessageVisibilityInput = GenerateChangeMessageVisibilityInputDefault
 	}
 
 	if c.QueueUrlResolver == nil {
@@ -179,6 +192,16 @@ func GenerateDeleteMessageInputDefault(ctx context.Context, queueURL QueueURL, r
 	return &sqs.DeleteMessageInput{
 		QueueUrl:      aws.String(string(queueURL)),
 		ReceiptHandle: receiptHandle,
+	}, nil
+}
+
+type GenerateChangeMessageVisibilityInputFunc func(ctx context.Context, queueURL QueueURL, receiptHandle *string) (*sqs.ChangeMessageVisibilityInput, error)
+
+func GenerateChangeMessageVisibilityInputDefault(ctx context.Context, queueURL QueueURL, receiptHandle *string) (*sqs.ChangeMessageVisibilityInput, error) {
+	return &sqs.ChangeMessageVisibilityInput{
+		QueueUrl:          aws.String(string(queueURL)),
+		ReceiptHandle:     receiptHandle,
+		VisibilityTimeout: 0,
 	}, nil
 }
 

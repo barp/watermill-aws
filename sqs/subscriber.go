@@ -219,8 +219,13 @@ func (s *Subscriber) processMessage(
 			return false
 		}
 	case <-msg.Nacked():
-		// Do not delete message, it will be redelivered
 		logger.Debug("Nacking message", logFields)
+		if s.config.ChangeVisibilityOnNack {
+			err := s.changeMessageVisibility(ctx, queueURL, sqsMsg.ReceiptHandle, logFields)
+			if err != nil {
+				logger.Error("Failed to change message visibility on nack", err, logFields)
+			}
+		}
 		return false // we don't want to process next messages to preserve order for FIFO
 	case <-s.closing:
 		logger.Debug("Closing, message discarded before ack", logFields)
@@ -231,6 +236,20 @@ func (s *Subscriber) processMessage(
 	}
 
 	return true
+}
+
+func (s *Subscriber) changeMessageVisibility(ctx context.Context, queueURL QueueURL, receiptHandle *string, logFields watermill.LogFields) error {
+	input, err := s.config.GenerateChangeMessageVisibilityInput(ctx, queueURL, receiptHandle)
+	if err != nil {
+		return fmt.Errorf("cannot generate input for change message visibility: %w", err)
+	}
+
+	_, err = s.sqs.ChangeMessageVisibility(ctx, input)
+	if err != nil {
+		return fmt.Errorf("cannot change message visibility: %w", err)
+	}
+
+	return nil
 }
 
 func (s *Subscriber) deleteMessage(ctx context.Context, queueURL QueueURL, receiptHandle *string, logFields watermill.LogFields) error {
