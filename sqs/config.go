@@ -40,6 +40,11 @@ type SubscriberConfig struct {
 	// GenerateDeleteMessageInput generates *sqs.DeleteMessageInput for AWS SDK.
 	GenerateDeleteMessageInput GenerateDeleteMessageInputFunc
 
+	// ConsumeWorkers is the number of goroutines that will concurrently receive and process messages
+	// from the SQS queue per Subscribe call. Each worker independently polls SQS and processes messages.
+	// Defaults to 1.
+	ConsumeWorkers int
+
 	Unmarshaler Unmarshaler
 }
 
@@ -66,6 +71,10 @@ func (c *SubscriberConfig) SetDefaults() {
 
 	if c.QueueUrlResolver == nil {
 		c.QueueUrlResolver = NewGetQueueUrlByNameUrlResolver(GetQueueUrlByNameUrlResolverConfig{})
+	}
+
+	if c.ConsumeWorkers <= 0 {
+		c.ConsumeWorkers = 1
 	}
 }
 
