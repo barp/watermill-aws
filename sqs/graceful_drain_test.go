@@ -46,7 +46,7 @@ func TestGracefulDrain_InFlightHandlerFinishesOnClose(t *testing.T) {
 		Marshaler:         sqs.DefaultMarshalerUnmarshaler{},
 	}, watermill.NewStdLogger(false, false))
 	require.NoError(t, err)
-	defer pub.Close()
+	defer func() { _ = pub.Close() }()
 
 	sub, err := sqs.NewSubscriber(sqs.SubscriberConfig{
 		AWSConfig:             cfg,
@@ -79,24 +79,25 @@ func TestGracefulDrain_InFlightHandlerFinishesOnClose(t *testing.T) {
 	)
 
 	go func() {
-		for msg := range out {
-			receivedCount.Add(1)
-			close(received)
-
-			// Work that spans the shutdown the main goroutine triggers below.
-			// If the drain works, the message context stays alive for the whole
-			// window; otherwise it is cancelled and we fall into the other case.
-			select {
-			case <-time.After(handlerWork):
-				ctxStayedAlive.Store(true)
-			case <-msg.Context().Done():
-				ctxStayedAlive.Store(false)
-			}
-
-			msg.Ack()
-			close(handlerAcked)
+		msg, ok := <-out
+		if !ok {
 			return
 		}
+		receivedCount.Add(1)
+		close(received)
+
+		// Work that spans the shutdown the main goroutine triggers below.
+		// If the drain works, the message context stays alive for the whole
+		// window; otherwise it is cancelled and we fall into the other case.
+		select {
+		case <-time.After(handlerWork):
+			ctxStayedAlive.Store(true)
+		case <-msg.Context().Done():
+			ctxStayedAlive.Store(false)
+		}
+
+		msg.Ack()
+		close(handlerAcked)
 	}()
 
 	select {
@@ -143,7 +144,7 @@ func TestGracefulDrain_InFlightHandlerFinishesOnClose(t *testing.T) {
 		Unmarshaler:           sqs.DefaultMarshalerUnmarshaler{},
 	}, watermill.NewStdLogger(false, false))
 	require.NoError(t, err)
-	defer sub2.Close()
+	defer func() { _ = sub2.Close() }()
 
 	out2, err := sub2.Subscribe(verifyCtx, topic)
 	require.NoError(t, err)
@@ -174,7 +175,7 @@ func TestGracefulDrain_Disabled_AbortsInFlightOnClose(t *testing.T) {
 		Marshaler:         sqs.DefaultMarshalerUnmarshaler{},
 	}, watermill.NewStdLogger(false, false))
 	require.NoError(t, err)
-	defer pub.Close()
+	defer func() { _ = pub.Close() }()
 
 	sub, err := sqs.NewSubscriber(sqs.SubscriberConfig{
 		AWSConfig:             cfg,
@@ -198,16 +199,17 @@ func TestGracefulDrain_Disabled_AbortsInFlightOnClose(t *testing.T) {
 	)
 
 	go func() {
-		for msg := range out {
-			close(received)
-			select {
-			case <-msg.Context().Done():
-				close(ctxCancelled) // aborted by close, as expected when draining is off
-			case <-time.After(20 * time.Second):
-			}
-			msg.Nack()
+		msg, ok := <-out
+		if !ok {
 			return
 		}
+		close(received)
+		select {
+		case <-msg.Context().Done():
+			close(ctxCancelled) // aborted by close, as expected when draining is off
+		case <-time.After(20 * time.Second):
+		}
+		msg.Nack()
 	}()
 
 	select {
