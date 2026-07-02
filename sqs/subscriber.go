@@ -2,6 +2,7 @@ package sqs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/aws/smithy-go"
@@ -71,14 +73,8 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 			return nil, fmt.Errorf("queue for topic '%s' doesn't exists", topic)
 		}
 
-		input, err := s.config.GenerateCreateQueueInput(ctx, resolvedQueue.QueueName, s.config.QueueConfigAttributes)
-		if err != nil {
-			return nil, fmt.Errorf("cannot generate input for queue %s: %w", topic, err)
-		}
-
-		_, err = createQueue(ctx, s.sqs, input)
-		if err != nil {
-			return nil, fmt.Errorf("cannot create queue %s: %w", topic, err)
+		if err := s.createSourceQueue(ctx, resolvedQueue.QueueName, topic); err != nil {
+			return nil, err
 		}
 
 		resolvedQueue, err = s.config.QueueUrlResolver.ResolveQueueUrl(ctx, resolveQueueParams)
@@ -375,21 +371,111 @@ func (s *Subscriber) SubscribeInitializeWithContext(ctx context.Context, topic s
 		return fmt.Errorf("queue for topic '%s' doesn't exists", topic)
 	}
 
-	input, err := s.config.GenerateCreateQueueInput(ctx, resolvedQueue.QueueName, s.config.QueueConfigAttributes)
+	if err := s.createSourceQueue(ctx, resolvedQueue.QueueName, topic); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// createSourceQueue creates the queue for a topic. When
+// SubscriberConfig.DeadLetterQueue is set it first provisions the dead-letter
+// queue and injects a redrive policy into the source queue's attributes so
+// failed messages are moved there.
+func (s *Subscriber) createSourceQueue(ctx context.Context, queueName QueueName, topic string) error {
+	input, err := s.config.GenerateCreateQueueInput(ctx, queueName, s.config.QueueConfigAttributes)
 	if err != nil {
 		return fmt.Errorf("cannot generate input for queue %s: %w", topic, err)
 	}
 
-	logger.Debug("Creating queue", watermill.LogFields{
-		"queue_name": *input.QueueName,
-	})
-
-	_, err = createQueue(ctx, s.sqs, input)
-	if err != nil {
-		return fmt.Errorf("cannot create queue %s: %w", topic, err)
+	if s.config.DeadLetterQueue != nil {
+		dlqArn, dlqErr := s.ensureDeadLetterQueue(ctx, queueName)
+		if dlqErr != nil {
+			return fmt.Errorf("cannot provision dead-letter queue for %s: %w", topic, dlqErr)
+		}
+		redrivePolicy, marshalErr := json.Marshal(map[string]any{
+			"deadLetterTargetArn": string(dlqArn),
+			"maxReceiveCount":     s.config.DeadLetterQueue.MaxReceiveCount,
+		})
+		if marshalErr != nil {
+			return fmt.Errorf("cannot marshal redrive policy for %s: %w", topic, marshalErr)
+		}
+		if input.Attributes == nil {
+			input.Attributes = map[string]string{}
+		}
+		input.Attributes[string(types.QueueAttributeNameRedrivePolicy)] = string(redrivePolicy)
 	}
 
+	s.logger.Debug("Creating queue", watermill.LogFields{"queue_name": *input.QueueName})
+
+	if _, err := createQueue(ctx, s.sqs, input); err != nil {
+		return fmt.Errorf("cannot create queue %s: %w", topic, err)
+	}
 	return nil
+}
+
+// ensureDeadLetterQueue provisions (idempotently) the dead-letter queue for a
+// source queue and returns its ARN: it creates the DLQ when missing and
+// refreshes its attributes and tags when it already exists.
+func (s *Subscriber) ensureDeadLetterQueue(ctx context.Context, sourceQueueName QueueName) (QueueArn, error) {
+	dlq := s.config.DeadLetterQueue
+	dlqName := dlq.GenerateName(sourceQueueName)
+
+	input, err := dlq.GenerateCreateQueueInput(ctx, dlqName, dlq.QueueConfigAttributes)
+	if err != nil {
+		return "", fmt.Errorf("cannot generate create input for dead-letter queue %s: %w", dlqName, err)
+	}
+
+	logFields := watermill.LogFields{"dlq_name": dlqName}
+
+	var dlqURL QueueURL
+	getOutput, getErr := s.sqs.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(string(dlqName))})
+	var notExist *types.QueueDoesNotExist
+	switch {
+	case getErr == nil && getOutput.QueueUrl != nil:
+		dlqURL = QueueURL(*getOutput.QueueUrl)
+		s.logger.Debug("Dead-letter queue already exists, refreshing", logFields)
+		if len(input.Attributes) > 0 {
+			if _, aerr := s.sqs.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{
+				QueueUrl:   aws.String(string(dlqURL)),
+				Attributes: input.Attributes,
+			}); aerr != nil {
+				s.logger.Error("Failed to update dead-letter queue attributes", aerr, logFields)
+			}
+		}
+		if len(input.Tags) > 0 {
+			if _, terr := s.sqs.TagQueue(ctx, &sqs.TagQueueInput{
+				QueueUrl: aws.String(string(dlqURL)),
+				Tags:     input.Tags,
+			}); terr != nil {
+				return "", fmt.Errorf("cannot tag dead-letter queue %s: %w", dlqName, terr)
+			}
+		}
+	case errors.As(getErr, &notExist):
+		s.logger.Info("Creating dead-letter queue", logFields)
+		created, cerr := createQueue(ctx, s.sqs, input)
+		if cerr != nil {
+			return "", fmt.Errorf("cannot create dead-letter queue %s: %w", dlqName, cerr)
+		}
+		if created != nil {
+			dlqURL = *created
+		} else {
+			// createQueue swallows QueueNameExists (created concurrently); resolve it.
+			resolved, rerr := getQueueUrl(ctx, s.sqs, string(dlqName), &sqs.GetQueueUrlInput{QueueName: aws.String(string(dlqName))})
+			if rerr != nil {
+				return "", fmt.Errorf("cannot resolve dead-letter queue %s after create: %w", dlqName, rerr)
+			}
+			dlqURL = *resolved
+		}
+	default:
+		return "", fmt.Errorf("cannot resolve dead-letter queue %s: %w", dlqName, getErr)
+	}
+
+	arn, err := getARNUrl(ctx, s.sqs, &dlqURL)
+	if err != nil {
+		return "", fmt.Errorf("cannot get ARN for dead-letter queue %s: %w", dlqName, err)
+	}
+	return *arn, nil
 }
 
 func (s *Subscriber) GetQueueUrl(ctx context.Context, topic string) (*QueueURL, error) {

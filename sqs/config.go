@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -58,6 +59,12 @@ type SubscriberConfig struct {
 	// redelivery.
 	CloseTimeout time.Duration
 
+	// DeadLetterQueue, when non-nil, makes the subscriber provision a companion
+	// dead-letter queue for each source queue it creates and attach a redrive
+	// policy, so a message that fails delivery MaxReceiveCount times is moved to
+	// the DLQ instead of being retried indefinitely. Nil (default) disables it.
+	DeadLetterQueue *DeadLetterQueueConfig
+
 	Unmarshaler Unmarshaler
 }
 
@@ -89,6 +96,10 @@ func (c *SubscriberConfig) SetDefaults() {
 	if c.ConsumeWorkers <= 0 {
 		c.ConsumeWorkers = 1
 	}
+
+	if c.DeadLetterQueue != nil {
+		c.DeadLetterQueue.setDefaults()
+	}
 }
 
 func (c SubscriberConfig) Validate() error {
@@ -104,8 +115,74 @@ func (c SubscriberConfig) Validate() error {
 	if c.QueueUrlResolver == nil {
 		err = errors.Join(err, fmt.Errorf("sqs.SubscriberConfig.QueueUrlResolver is nil"))
 	}
+	if c.DeadLetterQueue != nil {
+		err = errors.Join(err, c.DeadLetterQueue.validate())
+	}
 
 	return err
+}
+
+// DeadLetterQueueConfig configures automatic dead-letter queue provisioning for
+// a subscriber. See SubscriberConfig.DeadLetterQueue.
+type DeadLetterQueueConfig struct {
+	// MaxReceiveCount is the number of times SQS delivers a message before
+	// moving it to the dead-letter queue. Must be >= 1.
+	MaxReceiveCount int
+
+	// GenerateName derives the dead-letter queue's name from the source queue's
+	// name. Defaults to DeadLetterQueueNameDefault ("<source>-dlq", FIFO-aware,
+	// truncated to the 80-character SQS limit).
+	GenerateName func(sourceQueueName QueueName) QueueName
+
+	// GenerateCreateQueueInput builds the CreateQueueInput for the dead-letter
+	// queue itself. Defaults to GenerateCreateQueueInputDefault; override it to
+	// set the DLQ's retention period, tags, etc.
+	GenerateCreateQueueInput GenerateCreateQueueInputFunc
+
+	// QueueConfigAttributes is passed to GenerateCreateQueueInput when creating
+	// the dead-letter queue.
+	QueueConfigAttributes QueueConfigAttributes
+}
+
+func (c *DeadLetterQueueConfig) setDefaults() {
+	if c.GenerateName == nil {
+		c.GenerateName = DeadLetterQueueNameDefault
+	}
+	if c.GenerateCreateQueueInput == nil {
+		c.GenerateCreateQueueInput = GenerateCreateQueueInputDefault
+	}
+}
+
+func (c *DeadLetterQueueConfig) validate() error {
+	if c.MaxReceiveCount < 1 {
+		return fmt.Errorf("sqs.DeadLetterQueueConfig.MaxReceiveCount must be >= 1, got %d", c.MaxReceiveCount)
+	}
+	return nil
+}
+
+// maxQueueNameLength is the SQS hard limit on queue name length.
+const maxQueueNameLength = 80
+
+// DeadLetterQueueNameDefault derives a dead-letter queue name from a source
+// queue name by appending "-dlq", keeping a trailing ".fifo" in place for FIFO
+// queues, and truncating to the 80-character SQS limit.
+func DeadLetterQueueNameDefault(sourceQueueName QueueName) QueueName {
+	const suffix = "-dlq"
+	const fifoSuffix = ".fifo"
+
+	name := string(sourceQueueName)
+	if strings.HasSuffix(name, fifoSuffix) {
+		base := truncateQueueName(strings.TrimSuffix(name, fifoSuffix)+suffix, maxQueueNameLength-len(fifoSuffix))
+		return QueueName(base + fifoSuffix)
+	}
+	return QueueName(truncateQueueName(name+suffix, maxQueueNameLength))
+}
+
+func truncateQueueName(name string, maxLen int) string {
+	if len(name) <= maxLen {
+		return name
+	}
+	return name[:maxLen]
 }
 
 type PublisherConfig struct {
