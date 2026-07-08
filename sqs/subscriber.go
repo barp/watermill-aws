@@ -24,6 +24,11 @@ type Subscriber struct {
 	closing       chan struct{}
 	subscribersWg sync.WaitGroup
 
+	// deleteBatchers holds one batcher per Subscribe call when
+	// config.DeleteBatch is set; Close flushes them after all workers stop.
+	deleteBatchers     []*deleteBatcher
+	deleteBatchersLock sync.Mutex
+
 	closed     bool
 	closedLock sync.Mutex
 }
@@ -93,12 +98,20 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 	ctx, cancel := context.WithCancel(ctx)
 	output := make(chan *message.Message)
 
+	var batcher *deleteBatcher
+	if s.config.DeleteBatch != nil {
+		batcher = newDeleteBatcher(s.sqs, *resolvedQueue.QueueURL, *s.config.DeleteBatch, s.deleteTimeout(), s.logger)
+		s.deleteBatchersLock.Lock()
+		s.deleteBatchers = append(s.deleteBatchers, batcher)
+		s.deleteBatchersLock.Unlock()
+	}
+
 	var workersWg sync.WaitGroup
 	for i := 0; i < s.config.ConsumeWorkers; i++ {
 		workersWg.Add(1)
 		go func() {
 			defer workersWg.Done()
-			s.receive(ctx, *resolvedQueue.QueueURL, output, receiveInput)
+			s.receive(ctx, *resolvedQueue.QueueURL, output, receiveInput, batcher)
 		}()
 	}
 
@@ -113,7 +126,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 	return output, nil
 }
 
-func (s *Subscriber) receive(ctx context.Context, queueURL QueueURL, output chan *message.Message, input *sqs.ReceiveMessageInput) {
+func (s *Subscriber) receive(ctx context.Context, queueURL QueueURL, output chan *message.Message, input *sqs.ReceiveMessageInput, batcher *deleteBatcher) {
 	ctx, cancelCtx := context.WithCancel(ctx)
 	defer cancelCtx()
 	logFields := watermill.LogFields{
@@ -158,7 +171,7 @@ func (s *Subscriber) receive(ctx context.Context, queueURL QueueURL, output chan
 			s.logger.Trace("No messages", logFields)
 			continue
 		}
-		s.consumeMessages(ctx, result.Messages, queueURL, output, logFields)
+		s.consumeMessages(ctx, result.Messages, queueURL, output, logFields, batcher)
 	}
 }
 
@@ -168,9 +181,10 @@ func (s *Subscriber) consumeMessages(
 	queueURL QueueURL,
 	output chan *message.Message,
 	logFields watermill.LogFields,
+	batcher *deleteBatcher,
 ) {
 	for _, sqsMsg := range messages {
-		processed := s.processMessage(ctx, logFields, sqsMsg, output, queueURL)
+		processed := s.processMessage(ctx, logFields, sqsMsg, output, queueURL, batcher)
 
 		if !processed {
 			return
@@ -184,6 +198,7 @@ func (s *Subscriber) processMessage(
 	sqsMsg types.Message,
 	output chan *message.Message,
 	queueURL QueueURL,
+	batcher *deleteBatcher,
 ) bool {
 	logger := s.logger.With(logFields)
 	logger.Trace("processMessage", nil)
@@ -250,6 +265,13 @@ func (s *Subscriber) processMessage(
 	for {
 		select {
 		case <-msg.Acked():
+			if batcher != nil {
+				// Batched ack: hand the receipt handle off and keep consuming.
+				// Delete failures surface asynchronously as redeliveries (see
+				// SubscriberConfig.DeleteBatch).
+				batcher.add(sqsMsg.ReceiptHandle)
+				return true
+			}
 			err := s.deleteMessage(handlerCtx, queueURL, sqsMsg.ReceiptHandle, logFields)
 			if errors.Is(err, context.Canceled) {
 				return false
@@ -283,6 +305,16 @@ func (s *Subscriber) processMessage(
 			return false
 		}
 	}
+}
+
+// deleteTimeout bounds a delete call (single or batch) so a hung delete can't
+// stall a worker or shutdown: CloseTimeout when draining is configured,
+// otherwise a fixed safety net.
+func (s *Subscriber) deleteTimeout() time.Duration {
+	if s.config.CloseTimeout > 0 {
+		return s.config.CloseTimeout
+	}
+	return 30 * time.Second
 }
 
 func (s *Subscriber) deleteMessage(ctx context.Context, queueURL QueueURL, receiptHandle *string, logFields watermill.LogFields) error {
@@ -336,6 +368,16 @@ func (s *Subscriber) Close() error {
 
 	close(s.closing)
 	s.subscribersWg.Wait()
+
+	// All workers have stopped (and, with draining, finished their acks), so
+	// every receipt handle is already enqueued: flush the batched deletes.
+	s.deleteBatchersLock.Lock()
+	batchers := s.deleteBatchers
+	s.deleteBatchers = nil
+	s.deleteBatchersLock.Unlock()
+	for _, b := range batchers {
+		b.close()
+	}
 
 	return nil
 }

@@ -65,8 +65,53 @@ type SubscriberConfig struct {
 	// the DLQ instead of being retried indefinitely. Nil (default) disables it.
 	DeadLetterQueue *DeadLetterQueueConfig
 
+	// DeleteBatch, when non-nil, batches acks: instead of one DeleteMessage
+	// call per acked message, receipt handles are buffered per queue and
+	// deleted with DeleteMessageBatch (up to 10 per call), cutting SQS request
+	// count — and cost — by up to 10x on high-volume queues. Acking also stops
+	// blocking the consume worker on the delete round-trip.
+	//
+	// Semantics change vs the default: the delete becomes asynchronous, so a
+	// failed delete can no longer stop the worker from consuming the rest of
+	// its received batch — the failure is logged and the message is simply
+	// redelivered after the visibility timeout (the same at-least-once outcome
+	// as a failed synchronous delete). Do not enable on FIFO queues if you
+	// rely on that stop-on-failure ordering. The GenerateDeleteMessageInput
+	// hook is not applied on the batch path.
+	//
+	// Nil (default) preserves the one-DeleteMessage-per-ack behavior.
+	DeleteBatch *DeleteBatchConfig
+
 	Unmarshaler Unmarshaler
 }
+
+// DeleteBatchConfig configures batched message deletion. See
+// SubscriberConfig.DeleteBatch.
+type DeleteBatchConfig struct {
+	// MaxSize is the number of buffered receipt handles that triggers an
+	// immediate flush. SQS caps batch entries at 10; values outside [1, 10]
+	// are clamped into that range. Defaults to 10.
+	MaxSize int
+
+	// Linger is the longest a buffered receipt handle waits before being
+	// flushed regardless of batch size (worst case ~2x this, due to the
+	// ticker-based flusher). Defaults to 500ms. Keep it far below the queue's
+	// VisibilityTimeout: an acked-but-not-yet-deleted message whose visibility
+	// expires is redelivered.
+	Linger time.Duration
+}
+
+func (c *DeleteBatchConfig) setDefaults() {
+	if c.MaxSize <= 0 || c.MaxSize > sqsMaxBatchSize {
+		c.MaxSize = sqsMaxBatchSize
+	}
+	if c.Linger <= 0 {
+		c.Linger = 500 * time.Millisecond
+	}
+}
+
+// sqsMaxBatchSize is the SQS API limit on entries per DeleteMessageBatch call.
+const sqsMaxBatchSize = 10
 
 func (c *SubscriberConfig) SetDefaults() {
 	if c.Unmarshaler == nil {
@@ -99,6 +144,10 @@ func (c *SubscriberConfig) SetDefaults() {
 
 	if c.DeadLetterQueue != nil {
 		c.DeadLetterQueue.setDefaults()
+	}
+
+	if c.DeleteBatch != nil {
+		c.DeleteBatch.setDefaults()
 	}
 }
 
